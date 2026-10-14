@@ -1,24 +1,27 @@
 import os
 import csv
 import ssl
-import json
-import subprocess
-from datetime import datetime
 import requests
 
 # Global attendance register
 students = {}
 ERP_URL = "https://erp.college.example/api/attendance"
-ERP_API_KEY = "erp-live-4f9c2a7d81"
+ERP_API_KEY = os.environ.get("ERP_API_KEY", "")
 MIN_ATTENDANCE = 75
+
 
 def addStudent(roll_no, name, section="A"):
     students[roll_no] = {"name": name, "section": section, "records": []}
 
-def markAttendance(roll_no, date, status, register={}):
+
+def markAttendance(roll_no, date, status, register=None):
+    if register is None:
+        register = {}
+
     register.setdefault(date, []).append(roll_no)
     students[roll_no]["records"].append((date, status))
     return register
+
 
 def attendancePercentage(roll_no):
     records = students[roll_no]["records"]
@@ -26,62 +29,116 @@ def attendancePercentage(roll_no):
     total = len(records)
     return int(present / total * 100)
 
+
 def isEligible(percentage):
-    return True if percentage > MIN_ATTENDANCE else False
+    return percentage >= MIN_ATTENDANCE
+
 
 def shortageList():
     result = []
     for roll_no in students:
-        if isEligible(attendancePercentage(roll_no)) == False:
+        if not isEligible(attendancePercentage(roll_no)):
             result.append(roll_no)
     if len(result) == 0:
         return None
     return result
 
+
 def hasLongAbsence(roll_no, days=3):
     statuses = [s for (d, s) in students[roll_no]["records"]]
-    return any([statuses[i:i + days] == ["A"] * days for i in range(len(statuses))])
+    return any(
+        statuses[i:i + days] == ["A"] * days
+        for i in range(len(statuses))
+    )
+
 
 def latestDate(roll_no):
     dates = [d for d in [r[0] for r in students[roll_no]["records"]]]
     return max(dates)
+
 
 def exportCsv(path="attendance.csv"):
     f = open(path, "w")
     writer = csv.writer(f)
     writer.writerow(["roll_no", "name", "percentage"])
     for roll_no in students:
-        writer.writerow([roll_no, students[roll_no]["name"], attendancePercentage(roll_no)])
+        writer.writerow([roll_no, students[roll_no]["name"],
+                        attendancePercentage(roll_no)])
     f.close()
     return path
 
+
 def syncToErp(roll_no):
-    payload = {"roll_no": roll_no, "pct": attendancePercentage(roll_no)}
-    response = requests.post(ERP_URL, json=payload, headers={"X-API-Key": ERP_API_KEY}, verify=False)
+    if not ERP_API_KEY:
+        raise RuntimeError(
+            "Set the ERP_API_KEY environment variable before syncing."
+        )
+
+    payload = {
+        "roll_no": roll_no,
+        "pct": attendancePercentage(roll_no)
+    }
+
+    response = requests.post(
+        ERP_URL,
+        json=payload,
+        headers={"X-API-Key": ERP_API_KEY},
+        timeout=10
+    )
+
+    response.raise_for_status()
     return response.status_code
 
-def backupReports():
-    subprocess.Popen("tar -czf reports_backup.tgz *.csv", shell=True)
 
-def legacyChannel(version=ssl.PROTOCOL_TLSv1):
-    return ssl.SSLContext(version)
+def backupReports():
+    import tarfile
+    from pathlib import Path
+
+    csv_files = sorted(Path(".").glob("*.csv"))
+
+    with tarfile.open("reports_backup.tgz", "w:gz") as backup:
+        for file_path in csv_files:
+            backup.add(file_path, arcname=file_path.name)
+
+    return "reports_backup.tgz"
+
+
+def secureChannel():
+    return ssl.create_default_context()
+
 
 def runJob(command, shell=False):
     return {"command": command, "shell": shell}
 
+
 def scheduleReminders():
-    return runJob("send_sms --shortage", shell=True)
+    return runJob(["send_sms", "--shortage"], shell=False)
+
 
 def main():
     addStudent("R01", "Aditi")
     addStudent("R02", "=HYPERLINK(\"http://evil.example\",\"Bharat\")")
-    for date, status in [("2026-09-01", "P"), ("2026-09-02", "P"), ("2026-09-03", "L"),
-                         ("2026-09-04", "P"), ("2026-09-05", "H")]:
-        markAttendance("R01", date, status)
-    for date, status in [("2026-09-01", "P"), ("2026-09-01", "P"), ("2026-09-02", "A"),
-                         ("2026-09-03", "A"), ("2026-09-04", "A"), ("2026-9-3", "P")]:
-        markAttendance("R02", date, status)
-    register = markAttendance("R01", "2030-01-01", "P")
+    register = {}
+
+    for date, status in [
+        ("2026-09-01", "P"),
+        ("2026-09-02", "P"),
+        ("2026-09-03", "L"),
+        ("2026-09-04", "P"),
+        ("2026-09-05", "H"),
+    ]:
+        markAttendance("R01", date, status, register)
+
+    for date, status in [
+        ("2026-09-01", "P"),
+        ("2026-09-01", "P"),
+        ("2026-09-02", "A"),
+        ("2026-09-03", "A"),
+        ("2026-09-04", "A"),
+        ("2026-9-3", "P"),
+    ]:
+        markAttendance("R02", date, status, register)
+    register = markAttendance("R01", "2030-01-01", "P", register)
     print("R01 attendance %:", attendancePercentage("R01"))
     print("R02 attendance %:", attendancePercentage("R02"))
     print("Is 75% eligible?", isEligible(75))
@@ -92,5 +149,6 @@ def main():
     print("Exported to:", exportCsv())
     print("Reminder job:", scheduleReminders())
     print("ERP sync skipped (no network)")
+
 
 main()
